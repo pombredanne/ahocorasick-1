@@ -11,6 +11,8 @@ package ahocorasick
 
 import (
 	"container/list"
+	"sync"
+	"sync/atomic"
 )
 
 // A node in the trie structure used to implement Aho-Corasick
@@ -23,9 +25,8 @@ type node struct {
 	// be output when matching
 	index int // index into original dictionary if output is true
 
-	counter int // Set to the value of the Matcher.counter when a
+	counter uint64 // Set to the value of the Matcher.counter when a
 	// match is output to prevent duplicate output
-
 	// The use of fixed size arrays is space-inefficient but fast for
 	// lookups.
 
@@ -49,15 +50,18 @@ type node struct {
 // Matcher is returned by NewMatcher and contains a list of blices to
 // match against
 type Matcher struct {
-	counter int // Counts the number of matches done, and is used to
+	counter uint64 // Counts the number of matches done, and is used to
 	// prevent output of multiple matches of the same string
 	trie []node // preallocated block of memory containing all the
 	// nodes
 	extent int   // offset into trie that is currently free
 	root   *node // Points to trie[0]
+
+	heap sync.Pool // a pool of haystacks to de-duplicate results in
+	// a thread-safe manner
 }
 
-// finndBlice looks for a blice in the trie starting from the root and
+// findBlice looks for a blice in the trie starting from the root and
 // returns a pointer to the node representing the end of the blice. If
 // the blice is not found it returns nil.
 func (m *Matcher) findBlice(b []byte) *node {
@@ -213,13 +217,26 @@ func NewStringMatcher(dictionary []string) *Matcher {
 	return m
 }
 
-// Match searches in for blices and returns all the blices found as
-// indexes into the original dictionary
+// Match searches in for blices and returns all the blices found as indexes into
+// the original dictionary.
+//
+// This is not thread-safe method, seek for MatchThreadSafe() instead.
 func (m *Matcher) Match(in []byte) []int {
-	m.counter += 1
-	var hits []int
+	m.counter++
 
-	n := m.root
+	return match(in, m.root, func(f *node) bool {
+		if f.counter != m.counter {
+			f.counter = m.counter
+			return true
+		}
+		return false
+	})
+}
+
+// match is a core of matching logic. Accepts input byte slice, starting node
+// and a func to check whether should we include result into response or not
+func match(in []byte, n *node, unique func(f *node) bool) []int {
+	var hits []int
 
 	for _, b := range in {
 		c := int(b)
@@ -232,16 +249,16 @@ func (m *Matcher) Match(in []byte) []int {
 			f := n.child[c]
 			n = f
 
-			if f.output && f.counter != m.counter {
-				hits = append(hits, f.index)
-				f.counter = m.counter
+			if f.output {
+				if unique(f) {
+					hits = append(hits, f.index)
+				}
 			}
 
 			for !f.suffix.root {
 				f = f.suffix
-				if f.counter != m.counter {
+				if unique(f) {
 					hits = append(hits, f.index)
-					f.counter = m.counter
 				} else {
 
 					// There's no point working our way up the
@@ -255,4 +272,61 @@ func (m *Matcher) Match(in []byte) []int {
 	}
 
 	return hits
+}
+
+// MatchThreadSafe provides the same result as Match() but does it in a
+// thread-safe manner. Uses a sync.Pool of haystacks to track the uniqueness of
+// the result items.
+func (m *Matcher) MatchThreadSafe(in []byte) []int {
+	var (
+		heap map[int]uint64
+	)
+
+	generation := atomic.AddUint64(&m.counter, 1)
+	n := m.root
+	// read the matcher's heap
+	item := m.heap.Get()
+	if item == nil {
+		heap = make(map[int]uint64, len(m.trie))
+	} else {
+		heap = item.(map[int]uint64)
+	}
+
+	hits := match(in, n, func(f *node) bool {
+		g := heap[f.index]
+		if g != generation {
+			heap[f.index] = generation
+			return true
+		}
+		return false
+	})
+
+	m.heap.Put(heap)
+	return hits
+}
+
+// Contains returns true if any string matches. This can be faster
+// than Match() when you do not need to know which words matched.
+func (m *Matcher) Contains(in []byte) bool {
+	n := m.root
+	for _, b := range in {
+		c := int(b)
+		if !n.root {
+			n = n.fails[c]
+		}
+
+		if n.child[c] != nil {
+			f := n.child[c]
+			n = f
+
+			if f.output {
+				return true
+			}
+
+			for !f.suffix.root {
+				return true
+			}
+		}
+	}
+	return false
 }
